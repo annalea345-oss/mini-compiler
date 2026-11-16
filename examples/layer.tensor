@@ -1,0 +1,6 @@
+# A small neural-network layer: four samples, three features each.
+input x: matrix[4, 3]
+input weights: matrix[3, 2]
+input bias: vector[2]
+
+output = relu(x @ weights + bias)
