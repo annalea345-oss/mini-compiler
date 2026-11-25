@@ -174,10 +174,45 @@ def evaluate(node, data):
             for i in range(rows) for j in range(columns)]
 
 
-def emit_c(inputs, root, data):
-    """Emit one loop per operation. Input values are embedded for this first version."""
-    lines = ["#include <stdio.h>", "int main(void) {"]
+def fuse_operations(root):
+    """Fuse relu(matmul + row bias), preserving the original graph and inputs."""
+    rewritten = {}
+
+    def visit(node):
+        key = id(node)
+        if key in rewritten:
+            return rewritten[key]
+        args = tuple(visit(child) for child in node.args)
+        result = node if all(a is b for a, b in zip(args, node.args)) else Node(
+            node.op, node.shape, args, node.name)
+        if node.op == "relu" and args[0].op == "add":
+            product, bias = args[0].args
+            if product.op == "matmul" and bias.shape == (product.shape[1],):
+                result = Node("matmul_bias_relu", node.shape, (*product.args, bias))
+        rewritten[key] = result
+        return result
+
+    return visit(root)
+
+
+def emit_c(inputs, root, *, fuse=True):
+    """Emit fixed-shape loops with input values loaded from JSON at runtime."""
+    if fuse:
+        root = fuse_operations(root)
+    runtime = Path(__file__).with_name("tensor_runtime.c").read_text()
+    lines = [runtime, "int main(int argc, char **argv) {",
+             '  if (argc != 2) { fprintf(stderr, "Usage: %s INPUT.json\\n", argv[0]); return 1; }']
     names = {}
+    for node in inputs.values():
+        name = f"t{len(names)}"
+        names[id(node)] = name
+        lines.append(f"  double {name}[{math.prod(node.shape)}]; /* {node.name} */")
+    lines.append("  TensorInput inputs[] = {")
+    for node in inputs.values():
+        shape = ", ".join(str(d) for d in node.shape)
+        lines.append(f'    {{"{node.name}", {names[id(node)]}, {len(node.shape)}, {{{shape}}}, 0}},')
+    lines.extend(["  };", f"  char input_name[{max(len(name) for name in inputs) + 1}];",
+                  f"  load_inputs(argv[1], inputs, {len(inputs)}, input_name, sizeof(input_name));"])
 
     def emit(node):
         key = id(node)
@@ -187,12 +222,9 @@ def emit_c(inputs, root, data):
         name = f"t{len(names)}"
         names[key] = name
         size = math.prod(node.shape)
-        if node.op == "input":
-            values = ", ".join(repr(value) for value in data[node.name])
-            lines.append(f"  double {name}[{size}] = {{{values}}}; /* {node.name} */")
-        else:
+        if node.op != "input":
             lines.append(f"  double {name}[{size}]; /* {node.op}: {node.shape} */")
-            if node.op == "matmul":
+            if node.op in ("matmul", "matmul_bias_relu"):
                 rows, columns = node.shape
                 inner = node.args[0].shape[1]
                 lines.extend([
@@ -200,8 +232,14 @@ def emit_c(inputs, root, data):
                     f"    for (int j = 0; j < {columns}; ++j) {{",
                     "      double sum = 0.0;",
                     f"      for (int k = 0; k < {inner}; ++k)",
-                    f"        sum += {children[0]}[i*{inner}+k] * {children[1]}[k*{columns}+j];",
-                    f"      {name}[i*{columns}+j] = sum;", "    }"])
+                    f"        sum += {children[0]}[i*{inner}+k] * {children[1]}[k*{columns}+j];"])
+                if node.op == "matmul_bias_relu":
+                    # Add the bias after the reduction, as in the original graph.
+                    lines.extend([f"      sum += {children[2]}[j];",
+                                  f"      {name}[i*{columns}+j] = sum > 0.0 ? sum : 0.0;"])
+                else:
+                    lines.append(f"      {name}[i*{columns}+j] = sum;")
+                lines.append("    }")
             else:
                 if node.op == "add":
                     expression = f"{children[0]}[i] + {children[1]}[i % {math.prod(node.args[1].shape)}]"
@@ -228,26 +266,35 @@ def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("command", choices=["check", "run", "compile"])
     cli.add_argument("source", type=Path)
-    cli.add_argument("--data", type=Path, help="JSON input arrays (required for run/compile)")
+    cli.add_argument("--data", type=Path, help="JSON input arrays (for run only)")
     cli.add_argument("--out", type=Path, default=Path("build/program.c"))
+    cli.add_argument("--no-fuse", action="store_true",
+                     help="disable operation fusion for check/compile (run always uses the reference interpreter)")
     args = cli.parse_args()
     try:
         inputs, root = parse(args.source.read_text())
         if args.command == "check":
             print("Valid program. Typed calculation tree:")
             print("\n".join(explain(root)))
+            if not args.no_fuse:
+                optimized = fuse_operations(root)
+                if optimized is not root:
+                    print("\nAfter operation fusion:")
+                    print("\n".join(explain(optimized)))
             return 0
-        if args.data is None:
-            raise CompileError("--data is required for run and compile")
-        data = validate_data(inputs, json.loads(args.data.read_text()))
         if args.command == "run":
+            if args.data is None:
+                raise CompileError("--data is required for run")
+            data = validate_data(inputs, json.loads(args.data.read_text()))
             values = evaluate(root, data)
             result = values if len(root.shape) == 1 else [
                 values[i:i + root.shape[1]] for i in range(0, len(values), root.shape[1])]
             print(json.dumps(result, indent=2))
             return 0
+        if args.data is not None:
+            raise CompileError("compile no longer takes --data; pass the JSON file to the generated executable")
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(emit_c(inputs, root, data))
+        args.out.write_text(emit_c(inputs, root, fuse=not args.no_fuse))
         binary = args.out.with_suffix("")
         if binary == args.out:
             binary = args.out.with_name(args.out.name + ".bin")
