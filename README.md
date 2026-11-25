@@ -2,8 +2,8 @@
 
 A tiny language for calculations used in neural networks. It checks your program,
 executes it with a simple reference interpreter, or translates it into C and uses
-Clang to build a native executable. On an Apple Silicon Mac, that executable runs
-on the ARM CPU.
+Clang to build a native executable. On an Apple Silicon Mac, the C backend runs
+on the ARM CPU. A first Metal backend runs addition and ReLU on the Apple GPU.
 
 ## Try it
 
@@ -112,9 +112,9 @@ and generated code.
 `tensor_runtime.c` supplies the small input reader copied into each generated C
 file. The executable loads input values at runtime, then runs the generated
 calculation. The fusion pass described below combines eligible operations;
-other operations each generate a separate array and loop. There is no GPU backend
-yet. Arrays currently use stack
-storage, so large tensors may exceed the available stack. Performance benchmarks
+other operations each generate a separate array and loop. CPU arrays currently
+use stack storage, so large tensors may exceed the available stack. Metal uses
+shared GPU buffers. Performance benchmarks
 are still a later milestone and should measure calculation time separately from
 JSON loading and output.
 
@@ -144,6 +144,46 @@ For the example's 4-by-2 output, fusion reduces generated result storage from
 three arrays (24 doubles) to one array (8 doubles), excluding input storage.
 Clang may also optimize either version; a runtime speedup has not been measured.
 
+## Metal GPU backend
+
+The first GPU milestone supports **float32 addition, row bias broadcasting, and
+ReLU**, including composed expressions and direct input output. Matrix
+multiplication and operation fusion remain CPU features for now. Unsupported GPU
+operations produce a compile error rather than falling back to the CPU.
+
+Requires macOS, Apple's Command Line Tools, and an accessible Metal-capable GPU.
+The native integration tests were run on an Apple M3. For example:
+
+```sh
+python3 tensor_compiler.py check examples/activation.tensor --backend metal
+python3 tensor_compiler.py compile examples/activation.tensor --backend metal --out build/activation.m
+./build/activation examples/activation.json
+```
+
+The result is `[0, 0, 0.5, 0, 3.5, 3]`, printed one value per line.
+`--backend metal` defaults to float32; explicit float64 is rejected. The CPU
+backend continues to default to float64. To compare with the CPU interpreter:
+
+```sh
+python3 tensor_compiler.py run examples/activation.tensor --data examples/activation.json --dtype float32
+```
+
+Compilation generates three artifacts: an Objective-C `.m` host, readable `.metal`
+kernel source, and an executable. The host embeds the same MSL text and compiles
+it through Metal when the executable runs, so neither Xcode's standalone `metal`
+compiler nor the generated source files are needed at execution time.
+
+The host loads validated JSON directly into shared GPU buffers, builds a compute
+pipeline per operation, encodes the operations in dependency order, waits for
+completion, and prints the result. Each kernel handles one element per thread,
+with a bounds check for the final threadgroup. Metal uses safe math settings.
+All declared inputs are still required. `--no-fuse` has no effect on this backend.
+
+This is a correctness implementation. Shader compilation, pipeline creation,
+JSON loading, and GPU launch overhead occur on each run; no speedup is claimed.
+Processes without GPU access report an error. In particular, some sandboxes or
+headless CI environments cannot access a Metal device.
+
 ## Verify it
 
 ```sh
@@ -160,9 +200,15 @@ types, float32 overflow and underflow, and precision-sensitive reductions. Rando
 float32 results are also compared with float64 using relative and absolute
 tolerances of `2e-5` for those datasets; this is not a universal error bound.
 
+Metal tests check unsupported operations and types on all platforms. On macOS
+with Clang and an accessible Metal GPU, they also compile the host with warnings
+as errors, run generated kernels, and compare GPU results with float32 CPU and
+interpreter results. They cover broadcasting, nested operations, identity output,
+zero inputs, partial threadgroups, and input errors. GPU execution tests are
+explicitly skipped when a Metal device is unavailable.
+
 ## Next milestones
 
-1. Generate a simple Metal Shading Language kernel and add a Metal host runtime.
-2. Support the full matrix multiplication, bias, and ReLU calculation on the Apple GPU.
-3. Improve memory allocation for large tensors and benchmark CPU/GPU execution,
+1. Add matrix multiplication and fused bias/ReLU kernels to the Metal backend.
+2. Improve memory allocation for large CPU tensors and benchmark CPU/GPU execution,
    checking numerical agreement with appropriate tolerances.

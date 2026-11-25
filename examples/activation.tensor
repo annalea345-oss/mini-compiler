@@ -1,0 +1,5 @@
+# An elementwise calculation supported by both CPU and Metal backends.
+input x: matrix[3, 2]
+input bias: vector[2]
+
+output = relu(x + bias)

@@ -1,4 +1,4 @@
-"""A small tensor compiler: source -> typed graph -> portable C -> native code."""
+"""A small tensor compiler: source -> typed graph -> C/Metal -> CPU/GPU."""
 import argparse
 from dataclasses import dataclass
 import json
@@ -292,6 +292,79 @@ def emit_c(inputs, root, *, fuse=True, dtype="float64"):
     return "\n".join(lines) + "\n"
 
 
+def metal_nodes(root, *, dtype="float32"):
+    """Validate this backend's capabilities and return operations in dependency order."""
+    if dtype != "float32":
+        raise CompileError("Metal currently supports float32 only; use --dtype float32")
+    seen, nodes = set(), []
+
+    def visit(node):
+        if id(node) in seen:
+            return
+        if node.op not in ("input", "add", "relu"):
+            raise CompileError(f"Metal does not support {node.op!r} yet; use --backend cpu for matrix multiplication")
+        if math.prod(node.shape) > 2**32 - 1:
+            raise CompileError("Metal tensors must contain at most 2^32 - 1 elements")
+        seen.add(id(node))
+        for child in node.args:
+            visit(child)
+        if node.op != "input":
+            nodes.append(node)
+
+    visit(root)
+    return nodes
+
+
+def emit_metal(inputs, root, *, dtype="float32"):
+    """Generate MSL kernels and a standalone Objective-C host with embedded MSL."""
+    operations = metal_nodes(root, dtype=dtype)
+    for node in inputs.values():
+        metal_nodes(node, dtype=dtype)
+    nodes = list(inputs.values()) + operations
+    names = {id(node): f"t{i}" for i, node in enumerate(nodes)}
+    kernels = ["#include <metal_stdlib>", "using namespace metal;"]
+    for node in operations:
+        name = names[id(node)]
+        args = [f"device const float *a{i} [[buffer({i})]]" for i in range(len(node.args))]
+        args.extend([f"device float *out [[buffer({len(node.args)})]]",
+                     "uint i [[thread_position_in_grid]]"])
+        expression = (f"a0[i] + a1[i % {math.prod(node.args[1].shape)}u]" if node.op == "add"
+                      else "a0[i] > 0.0f ? a0[i] : 0.0f")
+        kernels.extend([f"kernel void {name}({', '.join(args)}) {{",
+                        f"  if (i < {math.prod(node.shape)}u) out[i] = {expression};", "}"])
+    shader = "\n".join(kernels) + "\n"
+    runtime = Path(__file__).with_name("tensor_runtime.c").read_text()
+    metal_runtime = Path(__file__).with_name("metal_runtime.m").read_text()
+    lines = ["/* Metal backend: float32, runtime-compiled embedded MSL. */",
+             "typedef float TensorValue;", "#define TENSOR_PARSE strtof", runtime, metal_runtime,
+             "int main(int argc, char **argv) {", "  @autoreleasepool {",
+             '    if (argc != 2) { fprintf(stderr, "Usage: %s INPUT.json\\n", argv[0]); return 1; }',
+             "    id<MTLDevice> device = MTLCreateSystemDefaultDevice();",
+             '    if (!device) fail("Metal", "no GPU device available");']
+    for node in nodes:
+        lines.append(f"    __attribute__((objc_precise_lifetime)) id<MTLBuffer> {names[id(node)]} = metal_buffer(device, {math.prod(node.shape)});")
+    lines.append("    TensorInput inputs[] = {")
+    for node in inputs.values():
+        shape = ", ".join(str(d) for d in node.shape)
+        lines.append(f'      {{"{node.name}", (float *){names[id(node)]}.contents, {len(node.shape)}, {{{shape}}}, 0}},')
+    lines.extend(["    };", f"    char input_name[{max(len(name) for name in inputs) + 1}];",
+                  f"    load_inputs(argv[1], inputs, {len(inputs)}, input_name, sizeof(input_name));"])
+    if operations:
+        lines.extend([f"    id<MTLLibrary> library = metal_library(device, @{json.dumps(shader)});",
+                      "    id<MTLCommandQueue> queue = [device newCommandQueue];",
+                      '    if (!queue) fail("Metal", "could not create command queue");',
+                      "    id<MTLCommandBuffer> command = [queue commandBuffer];",
+                      '    if (!command) fail("Metal", "could not create command buffer");'])
+        for node in operations:
+            buffers = ", ".join(names[id(child)] for child in (*node.args, node))
+            lines.append(f'    metal_encode(device, command, library, @"{names[id(node)]}", @[{buffers}], {math.prod(node.shape)});')
+        lines.append("    metal_finish(command);")
+    lines.extend([f"    const float *result = (const float *){names[id(root)]}.contents;",
+                  f'    for (size_t i = 0; i < {math.prod(root.shape)}; ++i) printf("%.9g\\n", (double)result[i]);',
+                  "  }", "  return 0;", "}"])
+    return shader, "\n".join(lines) + "\n"
+
+
 def explain(node, indent=0):
     label = f"input {node.name}" if node.op == "input" else node.op
     lines = ["  " * indent + f"{label}: {node.shape}"]
@@ -305,19 +378,27 @@ def main():
     cli.add_argument("command", choices=["check", "run", "compile"])
     cli.add_argument("source", type=Path)
     cli.add_argument("--data", type=Path, help="JSON input arrays (for run only)")
-    cli.add_argument("--out", type=Path, default=Path("build/program.c"))
-    cli.add_argument("--dtype", choices=["float32", "float64"], default="float64",
-                     help="numeric type for all inputs and calculations (default: float64)")
+    cli.add_argument("--backend", choices=["cpu", "metal"], default="cpu",
+                     help="compilation target (default: cpu; run uses the reference interpreter)")
+    cli.add_argument("--out", type=Path, help="generated host source (default: build/program.c or build/program.m)")
+    cli.add_argument("--dtype", choices=["float32", "float64"],
+                     help="numeric type (default: float64 for cpu, float32 for metal)")
     cli.add_argument("--no-fuse", action="store_true",
                      help="disable operation fusion for check/compile (run always uses the reference interpreter)")
     args = cli.parse_args()
     try:
+        args.dtype = args.dtype or ("float32" if args.backend == "metal" else "float64")
+        args.out = args.out or Path("build/program.m" if args.backend == "metal" else "build/program.c")
         inputs, root = parse(args.source.read_text())
+        if args.backend == "metal":
+            if args.command == "run":
+                raise CompileError("run uses the CPU reference interpreter; compile --backend metal, then run the executable")
+            metal_nodes(root, dtype=args.dtype)
         if args.command == "check":
             print("Valid program. Typed calculation tree:")
             print(f"Numeric type: {args.dtype}")
             print("\n".join(explain(root)))
-            if not args.no_fuse:
+            if args.backend == "cpu" and not args.no_fuse:
                 optimized = fuse_operations(root)
                 if optimized is not root:
                     print("\nAfter operation fusion:")
@@ -334,13 +415,28 @@ def main():
             return 0
         if args.data is not None:
             raise CompileError("compile no longer takes --data; pass the JSON file to the generated executable")
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(emit_c(inputs, root, fuse=not args.no_fuse, dtype=args.dtype))
+        if args.backend == "metal":
+            if sys.platform != "darwin":
+                raise CompileError("Building the Metal backend requires macOS and Apple's Command Line Tools")
+            if args.out.suffix != ".m":
+                raise CompileError("Metal --out must end in .m (Objective-C host source)")
+            shader, host = emit_metal(inputs, root, dtype=args.dtype)
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(host)
+            args.out.with_suffix(".metal").write_text(shader)
+        else:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(emit_c(inputs, root, fuse=not args.no_fuse, dtype=args.dtype))
         binary = args.out.with_suffix("")
         if binary == args.out:
             binary = args.out.with_name(args.out.name + ".bin")
-        subprocess.run(["clang", "-std=c11", "-O2", str(args.out), "-o", str(binary)], check=True)
-        print(f"Generated C: {args.out}")
+        command = ["clang", "-std=c11", "-O2", str(args.out), "-o", str(binary)]
+        if args.backend == "metal":
+            command.extend(["-fobjc-arc", "-framework", "Foundation", "-framework", "Metal"])
+        subprocess.run(command, check=True)
+        print(f"Generated {'Objective-C' if args.backend == 'metal' else 'C'}: {args.out}")
+        if args.backend == "metal":
+            print(f"Generated MSL: {args.out.with_suffix('.metal')}")
         print(f"Native executable: {binary}")
         return 0
     except (CompileError, OSError, ValueError, subprocess.CalledProcessError) as error:
