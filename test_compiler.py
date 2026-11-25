@@ -1,4 +1,6 @@
 import json
+import itertools
+import math
 from pathlib import Path
 import random
 import shutil
@@ -7,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from tensor_compiler import CompileError, emit_c, evaluate, explain, fuse_operations, parse, validate_data
+from tensor_compiler import CompileError, emit_c, evaluate, explain, float32, fuse_operations, parse, validate_data
 
 
 class CompilerTests(unittest.TestCase):
@@ -35,6 +37,24 @@ class CompilerTests(unittest.TestCase):
                      {"x": [[1, 2], [float('inf'), 4]]}, {"x": [[1, 2], [3, 4]], "extra": []}):
             with self.subTest(data=data), self.assertRaises(CompileError):
                 validate_data(inputs, data)
+
+    def test_float32_rounding_and_validation(self):
+        inputs, root = parse("input x: vector[2] output = x + x")
+        raw = {"x": [16777217, 0.1]}
+        data = validate_data(inputs, raw, dtype="float32")
+        self.assertEqual(data["x"][0], 16777216)
+        self.assertEqual(evaluate(root, data, dtype="float32"), [33554432, float32(0.2)])
+        self.assertEqual(evaluate(root, validate_data(inputs, raw))[0], 33554434)
+        for value in (1e39, -1e39):
+            with self.subTest(value=value), self.assertRaisesRegex(CompileError, "float32"):
+                validate_data(inputs, {"x": [value, 0]}, dtype="float32")
+        self.assertEqual(validate_data(inputs, {"x": [1e-50, -1e-50]}, dtype="float32")["x"],
+                         [0.0, -0.0])
+        for action in (lambda: validate_data(inputs, raw, dtype="float16"),
+                       lambda: evaluate(root, data, dtype="float16"),
+                       lambda: emit_c(inputs, root, dtype="float16")):
+            with self.assertRaises(CompileError):
+                action()
 
     def test_fusion_preserves_source_graph(self):
         inputs, root = parse("input x: matrix[2,3] input w: matrix[3,4] "
@@ -101,22 +121,67 @@ class CompilerTests(unittest.TestCase):
                 for _ in range(3):
                     raw_data = {name: array(node.shape) for name, node in inputs.items()}
                     datasets.append(raw_data)
-                for fuse in (False, True):
-                    with self.subTest(fuse=fuse):
-                        c_file.write_text(emit_c(inputs, root, fuse=fuse))
+                for dtype, fuse in itertools.product(("float64", "float32"), (False, True)):
+                    with self.subTest(dtype=dtype, fuse=fuse):
+                        c_file.write_text(emit_c(inputs, root, fuse=fuse, dtype=dtype))
                         subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
                                         str(c_file), "-o", str(binary)], check=True, capture_output=True)
                         # Reuse each binary with the same three independent datasets.
                         for raw_data in datasets:
-                            data = validate_data(inputs, raw_data)
+                            data = validate_data(inputs, raw_data, dtype=dtype)
                             data_file = Path(directory) / "input.json"
                             data_file.write_text(json.dumps(raw_data))
                             actual = [float(line) for line in subprocess.check_output(
                                 [str(binary), str(data_file)], text=True).splitlines()]
-                            expected = evaluate(root, data)
+                            expected = evaluate(root, data, dtype=dtype)
                             self.assertEqual(len(actual), len(expected))
                             for left, right in zip(actual, expected):
-                                self.assertAlmostEqual(left, right, places=10)
+                                self.assertTrue(math.isclose(left, right, rel_tol=1e-8, abs_tol=1e-10),
+                                                (dtype, left, right))
+                            if dtype == "float32":
+                                high_precision = evaluate(root, validate_data(inputs, raw_data))
+                                for left, right in zip(actual, high_precision):
+                                    self.assertTrue(math.isclose(left, right, rel_tol=2e-5, abs_tol=2e-5),
+                                                    (left, right))
+
+    @unittest.skipUnless(shutil.which("clang"), "clang is required for float32 tests")
+    def test_float32_native_boundaries(self):
+        cases = [
+            ("input x: vector[5] output = x",
+             {"x": [16777217, 0.1, 1e-40, 1e-50, 3.4028234663852886e38]}),
+            ("input x: matrix[1,3] input w: matrix[3,1] output = x @ w",
+             {"x": [[16777216, 1, -16777216]], "w": [[1], [1], [1]]}),
+            # A multiply-add contraction would incorrectly preserve a tiny residual.
+            ("input x: matrix[1,2] input w: matrix[2,1] output = x @ w",
+             {"x": [[-1 - 2**-22, 1 + 2**-23]], "w": [[1], [1 + 2**-23]]}),
+            ("input x: matrix[3,2] input w: matrix[2,1] input b: vector[1] "
+             "output = relu(x @ w + b)",
+             {"x": [[16777216, -16777216], [-1, 0], [-2, 0]],
+              "w": [[1], [1]], "b": [1]}),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            c_file = Path(directory) / "test.c"
+            binary = Path(directory) / "test"
+            data_file = Path(directory) / "input.json"
+            for source, raw in cases:
+                for fuse in (False, True):
+                    with self.subTest(source=source, fuse=fuse):
+                        inputs, root = parse(source)
+                        c_file.write_text(emit_c(inputs, root, dtype="float32", fuse=fuse))
+                        subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
+                                        str(c_file), "-o", str(binary)], check=True, capture_output=True)
+                        data_file.write_text(json.dumps(raw))
+                        actual = [float(v) for v in subprocess.check_output(
+                            [str(binary), str(data_file)], text=True).splitlines()]
+                        expected = evaluate(root, validate_data(inputs, raw, dtype="float32"), dtype="float32")
+                        self.assertEqual([float32(v) for v in actual], expected)
+            # The final executable must reject numbers finite in float64 but too large for float32.
+            raw["b"] = [1e39]
+            data_file.write_text(json.dumps(raw))
+            result = subprocess.run([str(binary), str(data_file)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("finite", result.stderr)
+            self.assertEqual(result.stdout, "")
 
     @unittest.skipUnless(shutil.which("clang"), "clang is required for fusion tests")
     def test_fusion_bias_order_and_relu_boundary(self):
@@ -204,6 +269,31 @@ class CompilerTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertTrue(result.stderr)
                     self.assertEqual(result.stdout, '')
+
+    @unittest.skipUnless(shutil.which("clang"), "clang is required for CLI tests")
+    def test_float32_cli(self):
+        here = Path(__file__).parent
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "rounding.tensor"
+            data_file = Path(directory) / "input.json"
+            c_file = Path(directory) / "program.c"
+            source.write_text("input x: vector[1] output = x + x")
+            data_file.write_text('{"x": [16777217]}')
+            cli = [sys.executable, str(here / "tensor_compiler.py")]
+            for options, expected in (([], 33554434), (["--dtype", "float32"], 33554432)):
+                with self.subTest(options=options):
+                    interpreted = subprocess.check_output(
+                        cli + ["run", str(source), "--data", str(data_file)] + options, text=True)
+                    self.assertEqual(json.loads(interpreted), [expected])
+                    subprocess.run(cli + ["compile", str(source), "--out", str(c_file)] + options,
+                                   check=True, capture_output=True)
+                    native = subprocess.check_output([str(c_file.with_suffix("")), str(data_file)], text=True)
+                    self.assertEqual(float(native), expected)
+            data_file.write_text('{"x": [1e39]}')
+            result = subprocess.run(cli + ["run", str(source), "--data", str(data_file),
+                                           "--dtype", "float32"], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("float32", result.stderr)
 
     @unittest.skipUnless(shutil.which("clang"), "clang is required for CLI tests")
     def test_compile_cli_without_data(self):

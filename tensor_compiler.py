@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 
@@ -128,7 +129,22 @@ def parse(source):
     return Parser(source).parse()
 
 
-def validate_data(inputs, data):
+def numeric_type(dtype):
+    if dtype not in ("float32", "float64"):
+        raise CompileError(f"Unsupported numeric type: {dtype!r}; use float32 or float64")
+    return "float" if dtype == "float32" else "double"
+
+
+def float32(value):
+    """Round to IEEE binary32, including arithmetic overflow to infinity."""
+    try:
+        return struct.unpack("f", struct.pack("f", value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def validate_data(inputs, data, *, dtype="float64"):
+    numeric_type(dtype)
     if not isinstance(data, dict):
         raise CompileError("Input JSON must be an object mapping names to arrays")
 
@@ -148,6 +164,10 @@ def validate_data(inputs, data):
             raise CompileError(f"{path}: number is too large")
         if not math.isfinite(number):
             raise CompileError(f"{path}: expected a finite number")
+        if dtype == "float32":
+            number = float32(number)
+            if not math.isfinite(number):
+                raise CompileError(f"{path}: expected a finite float32 number")
         return [number]
 
     for name in inputs:
@@ -158,20 +178,33 @@ def validate_data(inputs, data):
     return {name: check(data[name], node.shape, name) for name, node in inputs.items()}
 
 
-def evaluate(node, data):
+def evaluate(node, data, *, dtype="float64"):
     """Simple, deliberately unoptimized CPU reference implementation."""
-    if node.op == "input":
-        return data[node.name]
-    left = evaluate(node.args[0], data)
-    if node.op == "relu":
-        return [max(0.0, value) for value in left]
-    right = evaluate(node.args[1], data)
-    if node.op == "add":
-        return [value + right[i % len(right)] for i, value in enumerate(left)]
-    rows, columns = node.shape
-    inner = node.args[0].shape[1]
-    return [sum(left[i * inner + k] * right[k * columns + j] for k in range(inner))
-            for i in range(rows) for j in range(columns)]
+    numeric_type(dtype)
+    rounded = float32 if dtype == "float32" else float
+
+    def visit(current):
+        if current.op == "input":
+            return [rounded(value) for value in data[current.name]]
+        left = visit(current.args[0])
+        if current.op == "relu":
+            return [value if value > 0.0 else 0.0 for value in left]
+        right = visit(current.args[1])
+        if current.op == "add":
+            return [rounded(value + right[i % len(right)]) for i, value in enumerate(left)]
+        rows, columns = current.shape
+        inner = current.args[0].shape[1]
+        result = []
+        for i in range(rows):
+            for j in range(columns):
+                total = 0.0
+                for k in range(inner):
+                    product = rounded(left[i * inner + k] * right[k * columns + j])
+                    total = rounded(total + product)
+                result.append(total)
+        return result
+
+    return visit(node)
 
 
 def fuse_operations(root):
@@ -195,18 +228,23 @@ def fuse_operations(root):
     return visit(root)
 
 
-def emit_c(inputs, root, *, fuse=True):
+def emit_c(inputs, root, *, fuse=True, dtype="float64"):
     """Emit fixed-shape loops with input values loaded from JSON at runtime."""
+    ctype = numeric_type(dtype)
+    zero = "0.0f" if dtype == "float32" else "0.0"
+    precision = 9 if dtype == "float32" else 17
     if fuse:
         root = fuse_operations(root)
     runtime = Path(__file__).with_name("tensor_runtime.c").read_text()
-    lines = [runtime, "int main(int argc, char **argv) {",
+    lines = [f"/* Numeric type: {dtype} */", f"typedef {ctype} TensorValue;",
+             f"#define TENSOR_PARSE {'strtof' if dtype == 'float32' else 'strtod'}",
+             "#pragma STDC FP_CONTRACT OFF", runtime, "int main(int argc, char **argv) {",
              '  if (argc != 2) { fprintf(stderr, "Usage: %s INPUT.json\\n", argv[0]); return 1; }']
     names = {}
     for node in inputs.values():
         name = f"t{len(names)}"
         names[id(node)] = name
-        lines.append(f"  double {name}[{math.prod(node.shape)}]; /* {node.name} */")
+        lines.append(f"  {ctype} {name}[{math.prod(node.shape)}]; /* {node.name} */")
     lines.append("  TensorInput inputs[] = {")
     for node in inputs.values():
         shape = ", ".join(str(d) for d in node.shape)
@@ -223,20 +261,20 @@ def emit_c(inputs, root, *, fuse=True):
         names[key] = name
         size = math.prod(node.shape)
         if node.op != "input":
-            lines.append(f"  double {name}[{size}]; /* {node.op}: {node.shape} */")
+            lines.append(f"  {ctype} {name}[{size}]; /* {node.op}: {node.shape} */")
             if node.op in ("matmul", "matmul_bias_relu"):
                 rows, columns = node.shape
                 inner = node.args[0].shape[1]
                 lines.extend([
                     f"  for (int i = 0; i < {rows}; ++i)",
                     f"    for (int j = 0; j < {columns}; ++j) {{",
-                    "      double sum = 0.0;",
+                    f"      {ctype} sum = {zero};",
                     f"      for (int k = 0; k < {inner}; ++k)",
                     f"        sum += {children[0]}[i*{inner}+k] * {children[1]}[k*{columns}+j];"])
                 if node.op == "matmul_bias_relu":
                     # Add the bias after the reduction, as in the original graph.
                     lines.extend([f"      sum += {children[2]}[j];",
-                                  f"      {name}[i*{columns}+j] = sum > 0.0 ? sum : 0.0;"])
+                                  f"      {name}[i*{columns}+j] = sum > {zero} ? sum : {zero};"])
                 else:
                     lines.append(f"      {name}[i*{columns}+j] = sum;")
                 lines.append("    }")
@@ -244,12 +282,12 @@ def emit_c(inputs, root, *, fuse=True):
                 if node.op == "add":
                     expression = f"{children[0]}[i] + {children[1]}[i % {math.prod(node.args[1].shape)}]"
                 else:
-                    expression = f"{children[0]}[i] > 0.0 ? {children[0]}[i] : 0.0"
+                    expression = f"{children[0]}[i] > {zero} ? {children[0]}[i] : {zero}"
                 lines.append(f"  for (int i = 0; i < {size}; ++i) {name}[i] = {expression};")
         return name
 
     result = emit(root)
-    lines.extend([f'  for (int i = 0; i < {math.prod(root.shape)}; ++i) printf("%.17g\\n", {result}[i]);',
+    lines.extend([f'  for (int i = 0; i < {math.prod(root.shape)}; ++i) printf("%.{precision}g\\n", (double){result}[i]);',
                   "  return 0;", "}"])
     return "\n".join(lines) + "\n"
 
@@ -268,6 +306,8 @@ def main():
     cli.add_argument("source", type=Path)
     cli.add_argument("--data", type=Path, help="JSON input arrays (for run only)")
     cli.add_argument("--out", type=Path, default=Path("build/program.c"))
+    cli.add_argument("--dtype", choices=["float32", "float64"], default="float64",
+                     help="numeric type for all inputs and calculations (default: float64)")
     cli.add_argument("--no-fuse", action="store_true",
                      help="disable operation fusion for check/compile (run always uses the reference interpreter)")
     args = cli.parse_args()
@@ -275,6 +315,7 @@ def main():
         inputs, root = parse(args.source.read_text())
         if args.command == "check":
             print("Valid program. Typed calculation tree:")
+            print(f"Numeric type: {args.dtype}")
             print("\n".join(explain(root)))
             if not args.no_fuse:
                 optimized = fuse_operations(root)
@@ -285,8 +326,8 @@ def main():
         if args.command == "run":
             if args.data is None:
                 raise CompileError("--data is required for run")
-            data = validate_data(inputs, json.loads(args.data.read_text()))
-            values = evaluate(root, data)
+            data = validate_data(inputs, json.loads(args.data.read_text()), dtype=args.dtype)
+            values = evaluate(root, data, dtype=args.dtype)
             result = values if len(root.shape) == 1 else [
                 values[i:i + root.shape[1]] for i in range(0, len(values), root.shape[1])]
             print(json.dumps(result, indent=2))
@@ -294,7 +335,7 @@ def main():
         if args.data is not None:
             raise CompileError("compile no longer takes --data; pass the JSON file to the generated executable")
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(emit_c(inputs, root, fuse=not args.no_fuse))
+        args.out.write_text(emit_c(inputs, root, fuse=not args.no_fuse, dtype=args.dtype))
         binary = args.out.with_suffix("")
         if binary == args.out:
             binary = args.out.with_name(args.out.name + ".bin")

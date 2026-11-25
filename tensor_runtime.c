@@ -8,7 +8,7 @@
 
 typedef struct {
   const char *name;
-  double *values;
+  TensorValue *values;
   int rank;
   size_t shape[2];
   int seen;
@@ -33,7 +33,7 @@ static void expect(const char **p, char token, const char *input,
 
 static int digit(char c) { return c >= '0' && c <= '9'; }
 
-static double number(const char **p, const char *input) {
+static TensorValue number(const char **p, const char *input) {
   whitespace(p);
   const char *start = *p;
   if (**p == '-') ++*p;
@@ -54,7 +54,7 @@ static double number(const char **p, const char *input) {
     while (digit(**p)) ++*p;
   }
   char *end;
-  double value = strtod(start, &end);
+  TensorValue value = TENSOR_PARSE(start, &end);
   if (end != *p || !isfinite(value)) fail(input, "expected a finite number");
   return value;
 }

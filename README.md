@@ -61,11 +61,40 @@ output = relu(x @ weights + bias)
 - `#` starts a comment. Declare inputs first, followed by exactly one output expression.
 
 Values live in a separate JSON file with keys matching the input names. Shapes
-are fixed at compilation time. Numbers use double precision. Every declared input
+are fixed at compilation time. Numbers use double precision by default; use
+`--dtype float32` for single precision. Every declared input
 must be supplied exactly once, including unused inputs; key order does not matter.
 The executable rejects missing, unknown, or duplicate inputs, incorrect array
 shapes, malformed JSON, and values that are not finite numbers. Errors go to
 standard error with a nonzero exit status.
+
+## Numeric precision
+
+Choose one numeric type for the whole program; no DSL or JSON changes are needed:
+
+```sh
+python3 tensor_compiler.py check examples/layer.tensor --dtype float32
+python3 tensor_compiler.py run examples/layer.tensor --data examples/layer.json --dtype float32
+python3 tensor_compiler.py compile examples/layer.tensor --dtype float32 --out build/layer32.c
+./build/layer32 examples/layer.json
+```
+
+- `float64` (default) uses C `double`, with 8 bytes per tensor element.
+- `float32` uses C `float`, with 4 bytes per element, and rounds inputs and
+  arithmetic to single precision. It prepares the CPU backend for comparison
+  with a future GPU backend; execution still runs on the CPU.
+
+The numeric type is fixed when compiling. Recompile to change it. Both modes
+support fusion and `--no-fuse`. The reference interpreter rounds each product and
+addition to the selected precision. Generated C disables multiply-add contraction
+so multiplication and addition round separately, matching the reference order.
+This is separate from operation fusion, which removes intermediate arrays.
+
+Float32 can give slightly different answers: `16777217` rounds to `16777216`,
+for example. Inputs that overflow the selected type are rejected; tiny inputs
+may round to subnormal values or zero. Arithmetic overflow during calculation is
+not trapped and may produce infinity or NaN. Native output uses 9 significant
+digits for float32 and 17 for float64.
 
 ## How the compiler works
 
@@ -126,12 +155,14 @@ CLI, and native-vs-interpreter agreement on deterministic random inputs. Native
 tests reuse each executable with multiple datasets and require Clang. Both fused
 and unfused code are compared with the interpreter, including nested fusion,
 computed biases, single-element shapes, ReLU boundaries, and cancellation that
-would expose an incorrectly reordered bias addition.
+would expose an incorrectly reordered bias addition. Tests exercise both numeric
+types, float32 overflow and underflow, and precision-sensitive reductions. Random
+float32 results are also compared with float64 using relative and absolute
+tolerances of `2e-5` for those datasets; this is not a universal error bound.
 
 ## Next milestones
 
-1. Add 32-bit float support in preparation for GPU execution (currently double only).
-2. Generate a simple Metal Shading Language kernel and add a Metal host runtime.
-3. Support the full matrix multiplication, bias, and ReLU calculation on the Apple GPU.
-4. Improve memory allocation for large tensors and benchmark CPU/GPU execution,
+1. Generate a simple Metal Shading Language kernel and add a Metal host runtime.
+2. Support the full matrix multiplication, bias, and ReLU calculation on the Apple GPU.
+3. Improve memory allocation for large tensors and benchmark CPU/GPU execution,
    checking numerical agreement with appropriate tolerances.
