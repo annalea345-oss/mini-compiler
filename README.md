@@ -1,9 +1,9 @@
 # Mini tensor compiler
 
 A tiny language for calculations used in neural networks. It checks your program,
-executes it with a simple reference interpreter, or translates it into C and uses
-Clang to build a native executable. On an Apple Silicon Mac, the C backend runs
-on the ARM CPU. A first Metal backend runs addition and ReLU on the Apple GPU.
+executes it with a simple reference interpreter, or compiles it for CPU or GPU
+execution. On an Apple Silicon Mac, the C backend runs on the ARM CPU. The Metal
+backend generates MSL kernels and an Objective-C host for the Apple GPU.
 
 ## Try it
 
@@ -80,9 +80,8 @@ python3 tensor_compiler.py compile examples/layer.tensor --dtype float32 --out b
 ```
 
 - `float64` (default) uses C `double`, with 8 bytes per tensor element.
-- `float32` uses C `float`, with 4 bytes per element, and rounds inputs and
-  arithmetic to single precision. It prepares the CPU backend for comparison
-  with a future GPU backend; execution still runs on the CPU.
+- `float32` uses 4 bytes per element and rounds inputs and arithmetic to single
+  precision. Both CPU and Metal backends support it; CPU is the default backend.
 
 The numeric type is fixed when compiling. Recompile to change it. Both modes
 support fusion and `--no-fuse`. The reference interpreter rounds each product and
@@ -146,10 +145,10 @@ Clang may also optimize either version; a runtime speedup has not been measured.
 
 ## Metal GPU backend
 
-The first GPU milestone supports **float32 addition, row bias broadcasting, and
-ReLU**, including composed expressions and direct input output. Matrix
-multiplication and operation fusion remain CPU features for now. Unsupported GPU
-operations produce a compile error rather than falling back to the CPU.
+The GPU backend supports **float32 matrix multiplication, addition, row bias
+broadcasting, and ReLU**, including composed expressions and direct input output.
+It also fuses `relu(x @ weights + bias)` into one kernel by default. Unsupported
+GPU operations produce a compile error rather than falling back to the CPU.
 
 Requires macOS, Apple's Command Line Tools, and an accessible Metal-capable GPU.
 The native integration tests were run on an Apple M3. For example:
@@ -161,6 +160,23 @@ python3 tensor_compiler.py compile examples/activation.tensor --backend metal --
 ```
 
 The result is `[0, 0, 0.5, 0, 3.5, 3]`, printed one value per line.
+To run the original matrix multiplication example on the GPU:
+
+```sh
+python3 tensor_compiler.py check examples/layer.tensor --backend metal
+python3 tensor_compiler.py compile examples/layer.tensor --backend metal --out build/layer_gpu.m
+./build/layer_gpu examples/layer.json
+./build/layer_gpu examples/layer-alt.json
+```
+
+The outputs match the original example: `[0, 3.5, 0, 0.5, 3, 0, 0, 0]` and
+`[1, 2, 1, 2, 1, 2, 1, 2]`, respectively. For an unfused GPU version:
+
+```sh
+python3 tensor_compiler.py compile examples/layer.tensor --backend metal --no-fuse --out build/layer_gpu_unfused.m
+./build/layer_gpu_unfused examples/layer.json
+```
+
 `--backend metal` defaults to float32; explicit float64 is rejected. The CPU
 backend continues to default to float64. To compare with the CPU interpreter:
 
@@ -175,11 +191,20 @@ compiler nor the generated source files are needed at execution time.
 
 The host loads validated JSON directly into shared GPU buffers, builds a compute
 pipeline per operation, encodes the operations in dependency order, waits for
-completion, and prints the result. Each kernel handles one element per thread,
-with a bounds check for the final threadgroup. Metal uses safe math settings.
-All declared inputs are still required. `--no-fuse` has no effect on this backend.
+completion, and prints the result. Each kernel handles one output element per
+thread, with a bounds check for the final threadgroup. For matrix multiplication,
+each thread computes its output's row/column dot product. The fused kernel adds
+the column bias after the dot product, applies ReLU, and writes only the final
+result. It removes two intermediate buffers and reduces three dispatches to one
+for that pattern, including when nested inside larger expressions.
 
-This is a correctness implementation. Shader compilation, pipeline creation,
+Metal uses safe math settings and disables multiply-add contraction to keep
+products and additions separately rounded, as in the CPU reference. All declared
+inputs are still required. `check` shows the fused graph; `--no-fuse` disables the
+pass for both inspection and compilation.
+
+This is a correctness implementation with a simple, untiled matrix kernel.
+Shader compilation, pipeline creation,
 JSON loading, and GPU launch overhead occur on each run; no speedup is claimed.
 Processes without GPU access report an error. In particular, some sandboxes or
 headless CI environments cannot access a Metal device.
@@ -203,12 +228,16 @@ tolerances of `2e-5` for those datasets; this is not a universal error bound.
 Metal tests check unsupported operations and types on all platforms. On macOS
 with Clang and an accessible Metal GPU, they also compile the host with warnings
 as errors, run generated kernels, and compare GPU results with float32 CPU and
-interpreter results. They cover broadcasting, nested operations, identity output,
-zero inputs, partial threadgroups, and input errors. GPU execution tests are
+interpreter results. They cover fused and unfused matrix calculations, rectangular
+and single-element matrices, nested layers, computed biases, broadcasting,
+identity output, zero inputs, partial threadgroups, rounding-sensitive reductions,
+and input errors. Random comparisons use relative and absolute tolerances of
+`2e-5`; dedicated rounding and ReLU boundary cases require exact results. GPU execution tests are
 explicitly skipped when a Metal device is unavailable.
 
 ## Next milestones
 
-1. Add matrix multiplication and fused bias/ReLU kernels to the Metal backend.
-2. Improve memory allocation for large CPU tensors and benchmark CPU/GPU execution,
-   checking numerical agreement with appropriate tolerances.
+1. Move large CPU tensors off the stack and add a benchmark harness that separates
+   calculation timing from input loading, shader compilation, and output.
+2. Measure CPU versus GPU and fused versus unfused execution across tensor sizes.
+3. Use those measurements to guide GPU optimizations such as tiled matrix multiplication.

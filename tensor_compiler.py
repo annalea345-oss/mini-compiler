@@ -301,8 +301,8 @@ def metal_nodes(root, *, dtype="float32"):
     def visit(node):
         if id(node) in seen:
             return
-        if node.op not in ("input", "add", "relu"):
-            raise CompileError(f"Metal does not support {node.op!r} yet; use --backend cpu for matrix multiplication")
+        if node.op not in ("input", "add", "relu", "matmul", "matmul_bias_relu"):
+            raise CompileError(f"Metal does not support {node.op!r}")
         if math.prod(node.shape) > 2**32 - 1:
             raise CompileError("Metal tensors must contain at most 2^32 - 1 elements")
         seen.add(id(node))
@@ -315,23 +315,44 @@ def metal_nodes(root, *, dtype="float32"):
     return nodes
 
 
-def emit_metal(inputs, root, *, dtype="float32"):
+def emit_metal(inputs, root, *, dtype="float32", fuse=True):
     """Generate MSL kernels and a standalone Objective-C host with embedded MSL."""
-    operations = metal_nodes(root, dtype=dtype)
+    metal_nodes(root, dtype=dtype)
     for node in inputs.values():
         metal_nodes(node, dtype=dtype)
+    if fuse:
+        root = fuse_operations(root)
+    operations = metal_nodes(root, dtype=dtype)
     nodes = list(inputs.values()) + operations
     names = {id(node): f"t{i}" for i, node in enumerate(nodes)}
-    kernels = ["#include <metal_stdlib>", "using namespace metal;"]
+    kernels = ["#include <metal_stdlib>", "using namespace metal;",
+               "#pragma STDC FP_CONTRACT OFF"]
     for node in operations:
         name = names[id(node)]
         args = [f"device const float *a{i} [[buffer({i})]]" for i in range(len(node.args))]
         args.extend([f"device float *out [[buffer({len(node.args)})]]",
                      "uint i [[thread_position_in_grid]]"])
-        expression = (f"a0[i] + a1[i % {math.prod(node.args[1].shape)}u]" if node.op == "add"
-                      else "a0[i] > 0.0f ? a0[i] : 0.0f")
-        kernels.extend([f"kernel void {name}({', '.join(args)}) {{",
-                        f"  if (i < {math.prod(node.shape)}u) out[i] = {expression};", "}"])
+        kernels.extend([f"// {node.op}: {node.shape}",
+                        f"kernel void {name}({', '.join(args)}) {{",
+                        f"  if (i >= {math.prod(node.shape)}u) return;"])
+        if node.op in ("matmul", "matmul_bias_relu"):
+            columns = node.shape[1]
+            inner = node.args[0].shape[1]
+            kernels.extend([f"  uint row = i / {columns}u;",
+                            f"  uint column = i % {columns}u;",
+                            "  float sum = 0.0f;",
+                            f"  for (uint k = 0; k < {inner}u; ++k)",
+                            f"    sum += a0[row * {inner}u + k] * a1[k * {columns}u + column];"])
+            if node.op == "matmul_bias_relu":
+                kernels.extend(["  sum += a2[column];",
+                                "  out[i] = sum > 0.0f ? sum : 0.0f;"])
+            else:
+                kernels.append("  out[i] = sum;")
+        else:
+            expression = (f"a0[i] + a1[i % {math.prod(node.args[1].shape)}u]" if node.op == "add"
+                          else "a0[i] > 0.0f ? a0[i] : 0.0f")
+            kernels.append(f"  out[i] = {expression};")
+        kernels.append("}")
     shader = "\n".join(kernels) + "\n"
     runtime = Path(__file__).with_name("tensor_runtime.c").read_text()
     metal_runtime = Path(__file__).with_name("metal_runtime.m").read_text()
@@ -398,7 +419,7 @@ def main():
             print("Valid program. Typed calculation tree:")
             print(f"Numeric type: {args.dtype}")
             print("\n".join(explain(root)))
-            if args.backend == "cpu" and not args.no_fuse:
+            if not args.no_fuse:
                 optimized = fuse_operations(root)
                 if optimized is not root:
                     print("\nAfter operation fusion:")
@@ -420,7 +441,7 @@ def main():
                 raise CompileError("Building the Metal backend requires macOS and Apple's Command Line Tools")
             if args.out.suffix != ".m":
                 raise CompileError("Metal --out must end in .m (Objective-C host source)")
-            shader, host = emit_metal(inputs, root, dtype=args.dtype)
+            shader, host = emit_metal(inputs, root, dtype=args.dtype, fuse=not args.no_fuse)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(host)
             args.out.with_suffix(".metal").write_text(shader)
