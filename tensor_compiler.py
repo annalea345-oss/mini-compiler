@@ -236,21 +236,33 @@ def emit_c(inputs, root, *, fuse=True, dtype="float64"):
     if fuse:
         root = fuse_operations(root)
     runtime = Path(__file__).with_name("tensor_runtime.c").read_text()
-    lines = [f"/* Numeric type: {dtype} */", f"typedef {ctype} TensorValue;",
+    timing = Path(__file__).with_name("benchmark_runtime.c").read_text()
+    prefix = ["#define _DARWIN_C_SOURCE 1", "#define _POSIX_C_SOURCE 200809L", f"/* Numeric type: {dtype} */", f"typedef {ctype} TensorValue;",
              f"#define TENSOR_PARSE {'strtof' if dtype == 'float32' else 'strtod'}",
-             "#pragma STDC FP_CONTRACT OFF", runtime, "int main(int argc, char **argv) {",
-             '  if (argc != 2) { fprintf(stderr, "Usage: %s INPUT.json\\n", argv[0]); return 1; }']
+             "#pragma STDC FP_CONTRACT OFF", runtime, timing]
+    lines = ["int main(int argc, char **argv) {", "  RunOptions options = run_options(argc, argv);",
+             "  double setup_start = monotonic_ms();"]
+    body = []
     names = {}
+
+    def allocate(node, name):
+        size = math.prod(node.shape)
+        if size > sys.maxsize // (4 if dtype == "float32" else 8):
+            raise CompileError("Tensor allocation is too large for this platform")
+        lines.append(f"  {ctype} *{name} = tensor_alloc({size}); /* {node.name or node.op}: {node.shape} */")
+
     for node in inputs.values():
         name = f"t{len(names)}"
         names[id(node)] = name
-        lines.append(f"  {ctype} {name}[{math.prod(node.shape)}]; /* {node.name} */")
+        allocate(node, name)
     lines.append("  TensorInput inputs[] = {")
     for node in inputs.values():
         shape = ", ".join(str(d) for d in node.shape)
         lines.append(f'    {{"{node.name}", {names[id(node)]}, {len(node.shape)}, {{{shape}}}, 0}},')
     lines.extend(["  };", f"  char input_name[{max(len(name) for name in inputs) + 1}];",
-                  f"  load_inputs(argv[1], inputs, {len(inputs)}, input_name, sizeof(input_name));"])
+                  "  double load_start = monotonic_ms();",
+                  f"  load_inputs(argv[1], inputs, {len(inputs)}, input_name, sizeof(input_name));",
+                  "  double load_ms = monotonic_ms() - load_start;"])
 
     def emit(node):
         key = id(node)
@@ -261,35 +273,52 @@ def emit_c(inputs, root, *, fuse=True, dtype="float64"):
         names[key] = name
         size = math.prod(node.shape)
         if node.op != "input":
-            lines.append(f"  {ctype} {name}[{size}]; /* {node.op}: {node.shape} */")
+            allocate(node, name)
             if node.op in ("matmul", "matmul_bias_relu"):
                 rows, columns = node.shape
                 inner = node.args[0].shape[1]
-                lines.extend([
-                    f"  for (int i = 0; i < {rows}; ++i)",
-                    f"    for (int j = 0; j < {columns}; ++j) {{",
+                body.extend([
+                    f"  for (size_t i = 0; i < {rows}; ++i)",
+                    f"    for (size_t j = 0; j < {columns}; ++j) {{",
                     f"      {ctype} sum = {zero};",
-                    f"      for (int k = 0; k < {inner}; ++k)",
+                    f"      for (size_t k = 0; k < {inner}; ++k)",
                     f"        sum += {children[0]}[i*{inner}+k] * {children[1]}[k*{columns}+j];"])
                 if node.op == "matmul_bias_relu":
                     # Add the bias after the reduction, as in the original graph.
-                    lines.extend([f"      sum += {children[2]}[j];",
+                    body.extend([f"      sum += {children[2]}[j];",
                                   f"      {name}[i*{columns}+j] = sum > {zero} ? sum : {zero};"])
                 else:
-                    lines.append(f"      {name}[i*{columns}+j] = sum;")
-                lines.append("    }")
+                    body.append(f"      {name}[i*{columns}+j] = sum;")
+                body.append("    }")
             else:
                 if node.op == "add":
                     expression = f"{children[0]}[i] + {children[1]}[i % {math.prod(node.args[1].shape)}]"
                 else:
                     expression = f"{children[0]}[i] > {zero} ? {children[0]}[i] : {zero}"
-                lines.append(f"  for (int i = 0; i < {size}; ++i) {name}[i] = {expression};")
+                body.append(f"  for (size_t i = 0; i < {size}; ++i) {name}[i] = {expression};")
         return name
 
     result = emit(root)
-    lines.extend([f'  for (int i = 0; i < {math.prod(root.shape)}; ++i) printf("%.{precision}g\\n", (double){result}[i]);',
-                  "  return 0;", "}"])
-    return "\n".join(lines) + "\n"
+    params = ", ".join(f"{ctype} *{name}" for name in names.values())
+    compute = [f"__attribute__((noinline)) void compute({params}) {{"]
+    compute.extend(f"  (void){name};" for name in names.values())
+    compute.extend(body + ["}"])
+    call = f"compute({', '.join(names.values())});"
+    size = math.prod(root.shape)
+    lines.extend(["  double setup_ms = monotonic_ms() - setup_start - load_ms;",
+                  "  volatile double checksum = 0.0;",
+                  "  for (size_t step = 0; step < options.warmups + options.iterations; ++step) {",
+                  "    double start = monotonic_ms();", f"    {call}",
+                  "    double elapsed = monotonic_ms() - start;",
+                  "    if (options.benchmark) {",
+                  f"      checksum = result_checksum({result}, {size});",
+                  "      if (step >= options.warmups) options.wall[step - options.warmups] = elapsed;",
+                  "    }", "  }",
+                  '  if (options.benchmark) benchmark_report(options, setup_ms, load_ms, checksum, "CPU", 0);',
+                  f'  else for (size_t i = 0; i < {size}; ++i) printf("%.{precision}g\\n", (double){result}[i]);'])
+    lines.extend(f"  free({name});" for name in names.values())
+    lines.extend(["  return 0;", "}"])
+    return "\n".join(prefix + compute + lines) + "\n"
 
 
 def metal_nodes(root, *, dtype="float32"):
@@ -356,10 +385,12 @@ def emit_metal(inputs, root, *, dtype="float32", fuse=True):
     shader = "\n".join(kernels) + "\n"
     runtime = Path(__file__).with_name("tensor_runtime.c").read_text()
     metal_runtime = Path(__file__).with_name("metal_runtime.m").read_text()
-    lines = ["/* Metal backend: float32, runtime-compiled embedded MSL. */",
-             "typedef float TensorValue;", "#define TENSOR_PARSE strtof", runtime, metal_runtime,
+    timing = Path(__file__).with_name("benchmark_runtime.c").read_text()
+    lines = ["#define _DARWIN_C_SOURCE 1", "#define _POSIX_C_SOURCE 200809L", "/* Metal backend: float32, runtime-compiled embedded MSL. */",
+             "typedef float TensorValue;", "#define TENSOR_PARSE strtof", runtime, timing, metal_runtime,
              "int main(int argc, char **argv) {", "  @autoreleasepool {",
-             '    if (argc != 2) { fprintf(stderr, "Usage: %s INPUT.json\\n", argv[0]); return 1; }',
+             "    RunOptions options = run_options(argc, argv);",
+             "    double setup_start = monotonic_ms();",
              "    id<MTLDevice> device = MTLCreateSystemDefaultDevice();",
              '    if (!device) fail("Metal", "no GPU device available");']
     for node in nodes:
@@ -369,19 +400,40 @@ def emit_metal(inputs, root, *, dtype="float32", fuse=True):
         shape = ", ".join(str(d) for d in node.shape)
         lines.append(f'      {{"{node.name}", (float *){names[id(node)]}.contents, {len(node.shape)}, {{{shape}}}, 0}},')
     lines.extend(["    };", f"    char input_name[{max(len(name) for name in inputs) + 1}];",
-                  f"    load_inputs(argv[1], inputs, {len(inputs)}, input_name, sizeof(input_name));"])
+                  "    double load_start = monotonic_ms();",
+                  f"    load_inputs(argv[1], inputs, {len(inputs)}, input_name, sizeof(input_name));",
+                  "    double load_ms = monotonic_ms() - load_start;"])
     if operations:
         lines.extend([f"    id<MTLLibrary> library = metal_library(device, @{json.dumps(shader)});",
                       "    id<MTLCommandQueue> queue = [device newCommandQueue];",
-                      '    if (!queue) fail("Metal", "could not create command queue");',
-                      "    id<MTLCommandBuffer> command = [queue commandBuffer];",
-                      '    if (!command) fail("Metal", "could not create command buffer");'])
+                      '    if (!queue) fail("Metal", "could not create command queue");'])
+        for node in operations:
+            name = names[id(node)]
+            lines.append(f'    id<MTLComputePipelineState> p_{name} = metal_pipeline(device, library, @"{name}");')
+    lines.extend(["    double setup_ms = monotonic_ms() - setup_start - load_ms;",
+                  f"    const float *result = (const float *){names[id(root)]}.contents;",
+                  "    volatile double checksum = 0.0;",
+                  "    for (size_t step = 0; step < options.warmups + options.iterations; ++step) {",
+                  "      @autoreleasepool {",
+                  "        double start = monotonic_ms();", "        double gpu_ms = 0.0;"])
+    if operations:
+        lines.extend(["        id<MTLCommandBuffer> command = [queue commandBuffer];",
+                      '        if (!command) fail("Metal", "could not create command buffer");'])
         for node in operations:
             buffers = ", ".join(names[id(child)] for child in (*node.args, node))
-            lines.append(f'    metal_encode(device, command, library, @"{names[id(node)]}", @[{buffers}], {math.prod(node.shape)});')
-        lines.append("    metal_finish(command);")
-    lines.extend([f"    const float *result = (const float *){names[id(root)]}.contents;",
-                  f'    for (size_t i = 0; i < {math.prod(root.shape)}; ++i) printf("%.9g\\n", (double)result[i]);',
+            lines.append(f'        metal_encode(command, p_{names[id(node)]}, @[{buffers}], {math.prod(node.shape)});')
+        lines.append("        metal_finish(command);")
+    lines.append("        double elapsed = monotonic_ms() - start;")
+    if operations:
+        lines.append("        gpu_ms = (command.GPUEndTime - command.GPUStartTime) * 1000.0;")
+    lines.extend(["        if (options.benchmark) {",
+                  f"          checksum = result_checksum(result, {math.prod(root.shape)});",
+                  "          if (step >= options.warmups) {",
+                  "            options.wall[step - options.warmups] = elapsed;",
+                  "            options.gpu[step - options.warmups] = gpu_ms;",
+                  "          }", "        }", "      }", "    }",
+                  f"    if (options.benchmark) benchmark_report(options, setup_ms, load_ms, checksum, device.name.UTF8String, {1 if operations else 0});",
+                  f'    else for (size_t i = 0; i < {math.prod(root.shape)}; ++i) printf("%.9g\\n", (double)result[i]);',
                   "  }", "  return 0;", "}"])
     return shader, "\n".join(lines) + "\n"
 

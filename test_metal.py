@@ -168,6 +168,30 @@ class MetalExecutionTests(unittest.TestCase):
                                            ("layer-alt.json", [1, 2, 1, 2, 1, 2, 1, 2])):
                         output = subprocess.check_output([str(binary), str(HERE / "examples" / name)], text=True)
                         self.assertEqual([float(v) for v in output.splitlines()], expected)
+                    report = json.loads(subprocess.check_output(
+                        [str(binary), str(HERE / "examples/layer.json"), "3", "2"], text=True))
+                    self.assertEqual(report["checksum"], 7)
+                    self.assertEqual(report["warmups"], 2)
+                    self.assertEqual(len(report["wall_ms"]), 3)
+                    self.assertEqual(len(report["gpu_command_ms"]), 3)
+                    self.assertTrue(all(v > 0 for v in report["gpu_command_ms"]))
+                    self.assertGreater(report["setup_ms"], 0)
+
+    def test_gpu_benchmark_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            result = subprocess.run([sys.executable, str(HERE / "benchmark.py"), "--backends", "cpu", "metal",
+                                     "--sizes", "4", "--iterations", "2", "--warmups", "1",
+                                     "--workdir", str(Path(directory) / "work"), "--out", str(output)],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = json.loads(output.read_text())["results"]
+            self.assertEqual(len(rows), 4)
+            self.assertTrue(all(row["verified"] for row in rows))
+            for row in rows:
+                if row["backend"] == "metal":
+                    self.assertIsNotNone(row["gpu_command_summary"])
+                    self.assertEqual(len(row["gpu_command_ms"]), 2)
 
     def test_gpu_cli_and_input_errors(self):
         cli = [sys.executable, str(HERE / "tensor_compiler.py")]

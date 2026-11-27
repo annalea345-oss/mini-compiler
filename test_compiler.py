@@ -71,8 +71,8 @@ class CompilerTests(unittest.TestCase):
         # There should be only one result array instead of three intermediates.
         optimized = emit_c(inputs, root)
         unoptimized = emit_c(inputs, root, fuse=False)
-        self.assertEqual(optimized.count("  double t"), 4)
-        self.assertEqual(unoptimized.count("  double t"), 6)
+        self.assertEqual(optimized.count("  double *t"), 4)
+        self.assertEqual(unoptimized.count("  double *t"), 6)
 
     def test_fusion_leaves_other_operations_unchanged(self):
         declarations = "input x: matrix[2,2] input w: matrix[2,2] input b: vector[2] "

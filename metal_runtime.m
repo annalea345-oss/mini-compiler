@@ -27,14 +27,17 @@ id<MTLLibrary> metal_library(id<MTLDevice> device, NSString *source) {
   return library;
 }
 
-void metal_encode(id<MTLDevice> device, id<MTLCommandBuffer> command,
-                  id<MTLLibrary> library, NSString *name,
-                  NSArray<id<MTLBuffer>> *buffers, NSUInteger count) {
+id<MTLComputePipelineState> metal_pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString *name) {
   id<MTLFunction> function = [library newFunctionWithName:name];
   if (!function) fail("Metal", "kernel function not found");
   NSError *error = nil;
   id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
   if (!pipeline) fail("Metal pipeline", error.localizedDescription.UTF8String ?: "failed");
+  return pipeline;
+}
+
+void metal_encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline,
+                  NSArray<id<MTLBuffer>> *buffers, NSUInteger count) {
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   if (!encoder) fail("Metal", "could not create compute encoder");
   [encoder setComputePipelineState:pipeline];

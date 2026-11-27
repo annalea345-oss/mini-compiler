@@ -111,11 +111,11 @@ and generated code.
 `tensor_runtime.c` supplies the small input reader copied into each generated C
 file. The executable loads input values at runtime, then runs the generated
 calculation. The fusion pass described below combines eligible operations;
-other operations each generate a separate array and loop. CPU arrays currently
-use stack storage, so large tensors may exceed the available stack. Metal uses
-shared GPU buffers. Performance benchmarks
-are still a later milestone and should measure calculation time separately from
-JSON loading and output.
+other operations each generate a separate array and loop. CPU tensors use checked
+heap allocations and are freed after execution, so their size is no longer
+limited by stack space. Allocation overflow and failure produce errors. Metal
+uses shared GPU buffers. The benchmark harness described below measures
+calculation time separately from JSON loading, setup, and output.
 
 ## Operation fusion
 
@@ -203,11 +203,79 @@ products and additions separately rounded, as in the CPU reference. All declared
 inputs are still required. `check` shows the fused graph; `--no-fuse` disables the
 pass for both inspection and compilation.
 
-This is a correctness implementation with a simple, untiled matrix kernel.
-Shader compilation, pipeline creation,
-JSON loading, and GPU launch overhead occur on each run; no speedup is claimed.
+This uses a simple, untiled matrix kernel. Shader compilation, pipeline creation,
+and JSON loading occur once per process; pipeline states and buffers are reused
+when benchmarking repeated calculations. GPU launch overhead occurs on every
+iteration.
 Processes without GPU access report an error. In particular, some sandboxes or
 headless CI environments cannot access a Metal device.
+
+## Performance benchmarks
+
+Run the four float32 variants (CPU/GPU, fused/unfused) with the same deterministic
+inputs and full-result correctness checks against the interpreter:
+
+```sh
+python3 benchmark.py --sizes 16 64 128 256 --iterations 20 --warmups 5
+```
+
+For CPU-only environments, add `--backends cpu`. GPU access is required when
+Metal is requested; the harness reports an error rather than silently dropping
+it. Default sizes are 16, 64, and 128; shapes are square. Generated programs and
+inputs are kept in `build/benchmarks/`. The default JSON report is
+`build/benchmarks/report.json`; choose another path with `--out`.
+
+Each executable also supports benchmarks directly. For example:
+
+```sh
+python3 tensor_compiler.py compile examples/layer.tensor --dtype float32
+./build/program examples/layer.json 20 5
+```
+
+The two extra arguments select measured iterations and discarded warmups. This
+mode prints JSON timing samples and a result checksum instead of the array.
+Without those arguments, normal output is unchanged. Iterations must be
+1..1000000 and warmups 0..1000000.
+
+Timing definitions:
+
+- **Wall calculation time:** CPU computation, or Metal command encoding,
+  submission, and waiting for completion. This is the primary CPU/GPU comparison.
+- **GPU command time:** Metal's command-buffer end timestamp minus start timestamp,
+  read after completion. It includes all GPU passes and excludes CPU submission
+  overhead. It is additional context, not interchangeable with wall time.
+- **Setup and loading:** Allocation/device/shader/pipeline setup and JSON loading
+  are reported separately. Native host compilation is timed by the harness.
+
+All allocations and pipelines are outside the measured loop. Result checksums
+are consumed after each timed iteration to keep the CPU computation live; this
+scan, warmups, and printing are excluded from samples. CPU computation is a
+non-inlined function using the preallocated buffers. Timings use a monotonic
+clock (raw when available). Very short calculations can approach clock resolution.
+
+Reports retain raw samples, medians, means, ranges, verification status, device,
+compiler/OS, seed, source revision, and source hashes. Variants use a seeded
+shuffled order per size. Measurements are local observations subject to system
+load, clock scaling, and caching. The CPU backend is single-threaded generated
+C, not an optimized BLAS implementation; these are comparisons of this project's
+backends, not hardware performance limits.
+
+An Apple M3 run on macOS 15.7.2, using 20 measured iterations after 5 warmups,
+produced these median wall calculation times (milliseconds):
+
+| Square size | CPU unfused | CPU fused | GPU unfused | GPU fused |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 0.00029 | 0.00021 | 0.345 | 0.179 |
+| 64 | 0.103 | 0.105 | 0.357 | 0.198 |
+| 128 | 1.051 | 1.043 | 0.397 | 0.361 |
+| 256 | 11.062 | 11.122 | 0.633 | 0.591 |
+
+For this run, GPU launch overhead outweighed its advantage at small sizes; the
+GPU was faster at 128 and 256. Fusion reduced GPU wall time in these samples,
+but did not consistently improve CPU wall time. Full samples, setup/loading
+times, GPU command times, source hashes, and verification results are saved in
+[benchmarks/apple-m3.json](benchmarks/apple-m3.json). These are one machine's
+observations, not guarantees for other shapes or workloads.
 
 ## Verify it
 
@@ -235,9 +303,11 @@ and input errors. Random comparisons use relative and absolute tolerances of
 `2e-5`; dedicated rounding and ReLU boundary cases require exact results. GPU execution tests are
 explicitly skipped when a Metal device is unavailable.
 
+Allocation/benchmark tests include a 300,000-element CPU tensor under a 256 KB
+stack limit, oversized allocation rejection, iteration validation, CPU/GPU
+benchmark reports, sample counts, checksums, and the command-line harness.
+
 ## Next milestones
 
-1. Move large CPU tensors off the stack and add a benchmark harness that separates
-   calculation timing from input loading, shader compilation, and output.
-2. Measure CPU versus GPU and fused versus unfused execution across tensor sizes.
-3. Use those measurements to guide GPU optimizations such as tiled matrix multiplication.
+1. Use benchmark results to guide GPU optimizations such as tiled matrix multiplication.
+2. Expand measurements to rectangular shapes and compare against optimized libraries.

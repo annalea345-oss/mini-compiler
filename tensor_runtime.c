@@ -20,6 +20,13 @@ _Noreturn static void fail(const char *input, const char *message) {
   exit(EXIT_FAILURE);
 }
 
+TensorValue *tensor_alloc(size_t count) {
+  if (count > (size_t)-1 / sizeof(TensorValue)) fail(NULL, "tensor allocation size overflow");
+  TensorValue *values = malloc(count * sizeof(TensorValue));
+  if (!values) fail(NULL, "could not allocate tensor memory");
+  return values;
+}
+
 static void whitespace(const char **p) {
   while (**p && strchr(" \t\r\n", **p)) ++*p;
 }
