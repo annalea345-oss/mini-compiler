@@ -62,11 +62,13 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
             result = subprocess.run([sys.executable, str(HERE / "benchmark.py"), "--backends", "cpu",
-                                     "--sizes", "4", "--iterations", "2", "--warmups", "1",
+                                     "--sizes", "4", "--shapes", "3x5x7", "--iterations", "2", "--warmups", "1",
                                      "--workdir", str(Path(directory) / "work"), "--out", str(output)],
                                     text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = json.loads(output.read_text())["results"]
+            self.assertEqual(len(rows), 4)
+            self.assertEqual({tuple(row["shape"]) for row in rows}, {(4, 4, 4), (3, 5, 7)})
             self.assertEqual({row["fused"] for row in rows}, {False, True})
             for row in rows:
                 self.assertTrue(row["verified"])

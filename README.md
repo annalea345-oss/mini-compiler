@@ -241,7 +241,10 @@ python3 benchmark.py --sizes 16 64 128 256 --iterations 20 --warmups 5
 
 For CPU-only environments, add `--backends cpu`. GPU access is required when
 Metal is requested; the harness reports an error rather than silently dropping
-it. Default sizes are 16, 64, and 128; shapes are square. Generated programs and
+it. Default sizes are 16, 64, and 128. Use `--shapes MxKxN` for rectangular
+calculations, where `x` is M-by-K, weights are K-by-N, and output is M-by-N.
+Supplying shapes replaces default sizes; explicit `--sizes` and `--shapes` can
+be combined, with duplicate shapes removed. Generated programs and
 inputs are kept in `build/benchmarks/`. The default JSON report is
 `build/benchmarks/report.json`; choose another path with `--out`.
 
@@ -273,6 +276,62 @@ samples, and verification results are in
 [benchmarks/apple-m3-tiling.json](benchmarks/apple-m3-tiling.json). This is a
 single-machine observation, not a general performance guarantee or an automatic
 kernel-selection rule.
+
+### Rectangular workloads and Apple library comparisons
+
+Compare the generated CPU and GPU programs with Apple library implementations:
+
+```sh
+python3 benchmark.py --backends cpu metal accelerate mps --metal-kernels untiled tiled --shapes 1x256x128 32x128x256 128x64x256 33x65x97 --iterations 20 --warmups 5 --out build/benchmarks/apple-libraries.json
+```
+
+These synthetic workloads cover a single-input layer, batched layers with
+different input/output widths, and irregular dimensions. They perform exactly
+`relu(x @ weights + bias)` using the same runtime inputs. The comparison variants
+are selected through `benchmark.py`; compilation of the DSL continues to use
+the CPU or Metal backend.
+
+- **Accelerate:** Apple's [single-precision SGEMM](https://developer.apple.com/documentation/accelerate/blas-library)
+  followed by a CPU bias/ReLU pass. The baseline explicitly requests
+  single-threaded BLAS, matching the generated CPU backend's thread count.
+  This baseline requires macOS 15+ and a corresponding SDK.
+- **MPS:** Apple's [MPSMatrixMultiplication](https://developer.apple.com/documentation/metalperformanceshaders/mpsmatrixmultiplication)
+  followed by a custom GPU bias/ReLU kernel, encoded into the same command
+  buffer. Matrix descriptors use float32 and MPS-recommended padded row strides.
+  This uses a matrix multiplication and a postprocessing pass, rather than the
+  generated fused kernel's single dispatch.
+
+All variants include bias and ReLU in calculation timing. Library variants
+appear once per shape, with `fused: null` and an explicit implementation label.
+Requested CPU threading, M/K/N, maximum observed absolute error, and verification
+status are saved with each row. Library reduction orders can differ, so every
+full output is compared with the float32 reference using relative and absolute
+tolerances of `2e-5` before timing; iteration checksums are also checked.
+
+Library objects, buffers, and pipeline setup are reused. MPS input row packing
+is part of setup; output row unpacking is outside the timed calculation, as is
+the checksum scan for every variant. Setup and JSON loading remain separate
+metrics. Library initialization on the first calculation is handled by the
+discarded warmups. These measurements compare buffer-resident calculation paths,
+not end-to-end application latency or hardware limits.
+
+An M3 run with 20 measured iterations and 5 warmups produced these median wall
+times in milliseconds. Generated CPU and Metal columns use their fused variants;
+both library columns include their postprocessing passes:
+
+| M x K x N | CPU | Metal untiled | Metal tiled | Accelerate | MPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 x 256 x 128 | 0.0237 | 0.390 | 0.404 | 0.00075 | 0.362 |
+| 32 x 128 x 256 | 0.564 | 0.371 | 0.386 | 0.00596 | 0.352 |
+| 128 x 64 x 256 | 0.819 | 0.195 | 0.370 | 0.01925 | 0.367 |
+| 33 x 65 x 97 | 0.110 | 0.360 | 0.389 | 0.00542 | 0.367 |
+
+Accelerate was fastest on these four workloads, showing the gap between the
+simple generated CPU loops and an optimized library. GPU wall times include
+launch and completion overhead, which is significant at these sizes. This does
+not establish a universal backend-selection threshold. Full fused/unfused
+results, all output checks, measured errors, and raw timing samples are in
+[benchmarks/apple-m3-rectangular-libraries.json](benchmarks/apple-m3-rectangular-libraries.json).
 
 Each executable also supports benchmarks directly. For example:
 
@@ -357,8 +416,13 @@ explicitly skipped when a Metal device is unavailable.
 Allocation/benchmark tests include a 300,000-element CPU tensor under a 256 KB
 stack limit, oversized allocation rejection, iteration validation, CPU/GPU
 benchmark reports, sample counts, checksums, and the command-line harness.
+Apple library tests cover known answers, random and zero data, rectangular
+matrices with padded rows, repeated execution without accumulation, complete
+bias/ReLU behavior, input errors, and comparison report metadata. Apple-only
+tests are skipped on unsupported platforms; MPS tests also require GPU access.
 
 ## Next milestones
 
-1. Expand measurements to rectangular shapes and compare against optimized libraries.
-2. Use the measurements to tune tile sizes, kernel selection, and memory access patterns.
+1. Use rectangular and library comparisons to guide tile sizes, kernel selection,
+   memory access patterns, and CPU lowering improvements.
+2. Measure broader workloads and multiple runs before introducing automatic backend selection.
