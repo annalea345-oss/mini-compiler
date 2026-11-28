@@ -37,7 +37,7 @@ def summarize(samples):
             "mean_ms": statistics.mean(samples), "max_ms": max(samples)}
 
 
-def benchmark_case(size, backends, iterations, warmups, seed, workdir):
+def benchmark_case(size, backends, iterations, warmups, seed, workdir, metal_kernels):
     directory = workdir / f"n{size}"
     directory.mkdir(parents=True, exist_ok=True)
     source = (f"input x: matrix[{size},{size}]\ninput weights: matrix[{size},{size}]\n"
@@ -54,15 +54,18 @@ def benchmark_case(size, backends, iterations, warmups, seed, workdir):
     data_file.write_text(json.dumps(raw))
     inputs, root = parse(source)
     expected = evaluate(root, validate_data(inputs, raw, dtype="float32"), dtype="float32")
-    variants = list(itertools.product(backends, (False, True)))
+    variants = [(backend, fuse, kernel) for backend, fuse in itertools.product(backends, (False, True))
+                for kernel in (metal_kernels if backend == "metal" else (None,))]
     random.Random(seed + size).shuffle(variants)
     rows = []
-    for backend, fuse in variants:
+    for backend, fuse, kernel in variants:
         name = f"{backend}_{'fused' if fuse else 'unfused'}"
+        if kernel:
+            name += f"_{kernel}"
         source_file = directory / (name + (".m" if backend == "metal" else ".c"))
         binary = directory / name
         if backend == "metal":
-            shader, host = emit_metal(inputs, root, fuse=fuse)
+            shader, host = emit_metal(inputs, root, fuse=fuse, metal_kernel=kernel)
             source_file.write_text(host)
             source_file.with_suffix(".metal").write_text(shader)
         else:
@@ -83,13 +86,13 @@ def benchmark_case(size, backends, iterations, warmups, seed, workdir):
             raise CompileError(f"Benchmark checksum mismatch for {name}, size {size}")
         if len(native["wall_ms"]) != iterations:
             raise CompileError("Wrong number of timing samples")
-        row = {"size": size, "backend": backend, "fused": fuse, "dtype": "float32",
+        row = {"size": size, "backend": backend, "fused": fuse, "metal_kernel": kernel, "dtype": "float32",
                "verified": True, "compile_ms": compile_ms, **native,
                "wall_summary": summarize(native["wall_ms"]),
                "gpu_command_summary": (summarize(native["gpu_command_ms"])
                                        if native["gpu_command_ms"] is not None else None)}
         rows.append(row)
-        print(f"{size:5d}  {backend:5s}  {'fused' if fuse else 'unfused':7s}  "
+        print(f"{size:5d}  {backend:5s}  {'fused' if fuse else 'unfused':7s}  {kernel or '-':7s}  "
               f"{row['wall_summary']['median_ms']:12.6f}", flush=True)
     return rows
 
@@ -100,6 +103,8 @@ def main():
     cli.add_argument("--backends", choices=["cpu", "metal"], nargs="+",
                      default=["cpu", "metal"] if sys.platform == "darwin" else ["cpu"])
     cli.add_argument("--iterations", type=positive, default=10)
+    cli.add_argument("--metal-kernels", choices=["untiled", "tiled"], nargs="+", default=["untiled"],
+                     help="Metal matrix kernels to compare (default: untiled)")
     cli.add_argument("--warmups", type=int, default=3)
     cli.add_argument("--seed", type=int, default=23)
     cli.add_argument("--workdir", type=Path, default=Path("build/benchmarks"))
@@ -111,11 +116,11 @@ def main():
         cli.error("Metal requires macOS")
     try:
         args.workdir = args.workdir.resolve()
-        print(" size  target  mode      median wall ms", flush=True)
+        print(" size  target  mode     kernel   median wall ms", flush=True)
         rows = []
         for size in args.sizes:
             rows.extend(benchmark_case(size, list(dict.fromkeys(args.backends)), args.iterations,
-                                       args.warmups, args.seed, args.workdir))
+                                       args.warmups, args.seed, args.workdir, list(dict.fromkeys(args.metal_kernels))))
         repo = Path(__file__).parent
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
         dirty = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True)
@@ -127,7 +132,7 @@ def main():
                   "source_sha256": {name: hashlib.sha256((repo / name).read_bytes()).hexdigest()
                                     for name in ("tensor_compiler.py", "tensor_runtime.c", "metal_runtime.m",
                                                  "benchmark_runtime.c", "benchmark.py")},
-                  "notes": ["CPU is single-threaded generated C; Metal uses the untiled generated kernel.",
+                  "notes": ["CPU is single-threaded generated C; Metal kernel choice is recorded per variant.",
                             "Wall samples exclude allocation, JSON loading, shader/pipeline setup, checksum, and printing.",
                             "Metal wall samples include command encoding, submission, and waiting for completion.",
                             "GPU command samples use Metal command-buffer timestamps, including all passes.",

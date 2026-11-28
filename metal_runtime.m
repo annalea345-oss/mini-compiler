@@ -37,16 +37,24 @@ id<MTLComputePipelineState> metal_pipeline(id<MTLDevice> device, id<MTLLibrary> 
 }
 
 void metal_encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline,
-                  NSArray<id<MTLBuffer>> *buffers, NSUInteger count) {
+                  NSArray<id<MTLBuffer>> *buffers, NSUInteger rows, NSUInteger columns, BOOL tiled) {
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   if (!encoder) fail("Metal", "could not create compute encoder");
   [encoder setComputePipelineState:pipeline];
   for (NSUInteger i = 0; i < buffers.count; ++i)
     [encoder setBuffer:buffers[i] offset:0 atIndex:i];
-  NSUInteger width = MIN(pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup);
-  // Round up for devices without nonuniform threadgroup support. Kernels guard i < count.
-  [encoder dispatchThreadgroups:MTLSizeMake((count + width - 1) / width, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+  if (tiled) {
+    if (pipeline.maxTotalThreadsPerThreadgroup < 256) fail("Metal", "tiled kernels require 256 threads per group");
+    // Every lane runs the barriers, including lanes outside the output edges.
+    [encoder dispatchThreadgroups:MTLSizeMake((columns + 31) / 32, (rows + 31) / 32, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+  } else {
+    NSUInteger count = rows * columns;
+    NSUInteger width = MIN(pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup);
+    // Round up for devices without nonuniform threadgroup support. Kernels guard i < count.
+    [encoder dispatchThreadgroups:MTLSizeMake((count + width - 1) / width, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+  }
   [encoder endEncoding];
 }
 

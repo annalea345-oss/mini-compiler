@@ -344,8 +344,10 @@ def metal_nodes(root, *, dtype="float32"):
     return nodes
 
 
-def emit_metal(inputs, root, *, dtype="float32", fuse=True):
+def emit_metal(inputs, root, *, dtype="float32", fuse=True, metal_kernel="untiled"):
     """Generate MSL kernels and a standalone Objective-C host with embedded MSL."""
+    if metal_kernel not in ("untiled", "tiled"):
+        raise CompileError("Metal kernel must be untiled or tiled")
     metal_nodes(root, dtype=dtype)
     for node in inputs.values():
         metal_nodes(node, dtype=dtype)
@@ -358,24 +360,65 @@ def emit_metal(inputs, root, *, dtype="float32", fuse=True):
                "#pragma STDC FP_CONTRACT OFF"]
     for node in operations:
         name = names[id(node)]
+        tiled = metal_kernel == "tiled" and node.op in ("matmul", "matmul_bias_relu")
         args = [f"device const float *a{i} [[buffer({i})]]" for i in range(len(node.args))]
-        args.extend([f"device float *out [[buffer({len(node.args)})]]",
-                     "uint i [[thread_position_in_grid]]"])
+        args.append(f"device float *out [[buffer({len(node.args)})]]")
+        if tiled:
+            args.extend(["uint2 group [[threadgroup_position_in_grid]]",
+                         "uint2 local [[thread_position_in_threadgroup]]"])
+        else:
+            args.append("uint i [[thread_position_in_grid]]")
         kernels.extend([f"// {node.op}: {node.shape}",
-                        f"kernel void {name}({', '.join(args)}) {{",
-                        f"  if (i >= {math.prod(node.shape)}u) return;"])
+                        f"kernel void {name}({', '.join(args)}) {{"])
+        if not tiled:
+            kernels.append(f"  if (i >= {math.prod(node.shape)}u) return;")
         if node.op in ("matmul", "matmul_bias_relu"):
+            rows = node.shape[0]
             columns = node.shape[1]
             inner = node.args[0].shape[1]
-            kernels.extend([f"  uint row = i / {columns}u;",
+            if tiled:
+                kernels.extend(["  uint row = group.y * 32u + local.y * 2u;",
+                                "  uint column = group.x * 32u + local.x * 2u;",
+                                "  threadgroup float left_tile[32][32];",
+                                "  threadgroup float right_tile[32][32];",
+                                "  float4 sum = float4(0.0f);",
+                                f"  for (uint block = 0; block < {(inner + 31) // 32}u; ++block) {{",
+                                "    uint base = block * 32u;",
+                                "    for (uint dy = 0; dy < 2u; ++dy)",
+                                "      for (uint dx = 0; dx < 2u; ++dx) {",
+                                "        uint ty = local.y * 2u + dy, tx = local.x * 2u + dx;",
+                                f"        left_tile[ty][tx] = row + dy < {rows}u && base + tx < {inner}u",
+                                f"          ? a0[(row + dy) * {inner}u + base + tx] : 0.0f;",
+                                f"        right_tile[ty][tx] = base + ty < {inner}u && column + dx < {columns}u",
+                                f"          ? a1[(base + ty) * {columns}u + column + dx] : 0.0f;",
+                                "      }",
+                                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                                f"    for (uint k = 0; k < min(32u, {inner}u - base); ++k) {{",
+                                "      float l0 = left_tile[local.y * 2u][k], l1 = left_tile[local.y * 2u + 1u][k];",
+                                "      float r0 = right_tile[k][local.x * 2u], r1 = right_tile[k][local.x * 2u + 1u];",
+                                "      sum.x += l0 * r0; sum.y += l0 * r1;",
+                                "      sum.z += l1 * r0; sum.w += l1 * r1;",
+                                "    }",
+                                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                                "  }",
+                                "  for (uint dy = 0; dy < 2u; ++dy)",
+                                "    for (uint dx = 0; dx < 2u; ++dx) {",
+                                f"      if (row + dy >= {rows}u || column + dx >= {columns}u) continue;",
+                                "      float value = sum[dy * 2u + dx];"])
+                if node.op == "matmul_bias_relu":
+                    kernels.extend(["      value += a2[column + dx];",
+                                    "      value = value > 0.0f ? value : 0.0f;"])
+                kernels.extend([f"      out[(row + dy) * {columns}u + column + dx] = value;", "    }"])
+            else:
+                kernels.extend([f"  uint row = i / {columns}u;",
                             f"  uint column = i % {columns}u;",
                             "  float sum = 0.0f;",
                             f"  for (uint k = 0; k < {inner}u; ++k)",
                             f"    sum += a0[row * {inner}u + k] * a1[k * {columns}u + column];"])
-            if node.op == "matmul_bias_relu":
+            if node.op == "matmul_bias_relu" and not tiled:
                 kernels.extend(["  sum += a2[column];",
                                 "  out[i] = sum > 0.0f ? sum : 0.0f;"])
-            else:
+            elif not tiled:
                 kernels.append("  out[i] = sum;")
         else:
             expression = (f"a0[i] + a1[i % {math.prod(node.args[1].shape)}u]" if node.op == "add"
@@ -421,7 +464,9 @@ def emit_metal(inputs, root, *, dtype="float32", fuse=True):
                       '        if (!command) fail("Metal", "could not create command buffer");'])
         for node in operations:
             buffers = ", ".join(names[id(child)] for child in (*node.args, node))
-            lines.append(f'        metal_encode(command, p_{names[id(node)]}, @[{buffers}], {math.prod(node.shape)});')
+            tiled = metal_kernel == "tiled" and node.op in ("matmul", "matmul_bias_relu")
+            rows, columns = node.shape if len(node.shape) == 2 else (node.shape[0], 1)
+            lines.append(f'        metal_encode(command, p_{names[id(node)]}, @[{buffers}], {rows}, {columns}, {"YES" if tiled else "NO"});')
         lines.append("        metal_finish(command);")
     lines.append("        double elapsed = monotonic_ms() - start;")
     if operations:
@@ -458,6 +503,8 @@ def main():
                      help="numeric type (default: float64 for cpu, float32 for metal)")
     cli.add_argument("--no-fuse", action="store_true",
                      help="disable operation fusion for check/compile (run always uses the reference interpreter)")
+    cli.add_argument("--metal-kernel", choices=["untiled", "tiled"], default="untiled",
+                     help="Metal matrix multiplication implementation (default: untiled)")
     args = cli.parse_args()
     try:
         args.dtype = args.dtype or ("float32" if args.backend == "metal" else "float64")
@@ -470,6 +517,8 @@ def main():
         if args.command == "check":
             print("Valid program. Typed calculation tree:")
             print(f"Numeric type: {args.dtype}")
+            if args.backend == "metal":
+                print(f"Metal matrix kernel: {args.metal_kernel}")
             print("\n".join(explain(root)))
             if not args.no_fuse:
                 optimized = fuse_operations(root)
@@ -493,7 +542,8 @@ def main():
                 raise CompileError("Building the Metal backend requires macOS and Apple's Command Line Tools")
             if args.out.suffix != ".m":
                 raise CompileError("Metal --out must end in .m (Objective-C host source)")
-            shader, host = emit_metal(inputs, root, dtype=args.dtype, fuse=not args.no_fuse)
+            shader, host = emit_metal(inputs, root, dtype=args.dtype, fuse=not args.no_fuse,
+                                      metal_kernel=args.metal_kernel)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(host)
             args.out.with_suffix(".metal").write_text(shader)

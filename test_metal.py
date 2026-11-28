@@ -29,6 +29,8 @@ class MetalBackendTests(unittest.TestCase):
             emit_metal(inputs, Node("unsupported_op", (1,), (root,)))
         with self.assertRaisesRegex(CompileError, "float32 only"):
             emit_metal(inputs, root, dtype="float64")
+        with self.assertRaisesRegex(CompileError, "kernel"):
+            emit_metal(inputs, root, metal_kernel="invalid")
         inputs, root = parse("input x: matrix[65536,65536] output = x")
         with self.assertRaisesRegex(CompileError, "elements"):
             emit_metal(inputs, root)
@@ -98,10 +100,10 @@ class MetalExecutionTests(unittest.TestCase):
             cpu_file = Path(directory) / "cpu.c"
             cpu = Path(directory) / "cpu"
             data_file = Path(directory) / "input.json"
-            for source, fuse in itertools.product(programs, (False, True)):
-                with self.subTest(source=source, fuse=fuse):
+            for source, fuse, kernel in itertools.product(programs, (False, True), ("untiled", "tiled")):
+                with self.subTest(source=source, fuse=fuse, kernel=kernel):
                     inputs, root = parse(source)
-                    _, host = emit_metal(inputs, root, fuse=fuse)
+                    _, host = emit_metal(inputs, root, fuse=fuse, metal_kernel=kernel)
                     host_file.write_text(host)
                     build_host(host_file, gpu)
                     cpu_file.write_text(emit_c(inputs, root, dtype="float32", fuse=fuse))
@@ -142,11 +144,11 @@ class MetalExecutionTests(unittest.TestCase):
             host = Path(directory) / "gpu.m"
             binary = host.with_suffix("")
             data_file = Path(directory) / "input.json"
-            for (source, raw, expected), fuse in itertools.product(cases, (False, True)):
-                with self.subTest(source=source, fuse=fuse):
+            for (source, raw, expected), fuse, kernel in itertools.product(cases, (False, True), ("untiled", "tiled")):
+                with self.subTest(source=source, fuse=fuse, kernel=kernel):
                     inputs, root = parse(source)
                     self.assertEqual(evaluate(root, validate_data(inputs, raw, dtype="float32"), dtype="float32"), expected)
-                    _, generated = emit_metal(inputs, root, fuse=fuse)
+                    _, generated = emit_metal(inputs, root, fuse=fuse, metal_kernel=kernel)
                     host.write_text(generated)
                     build_host(host, binary)
                     data_file.write_text(json.dumps(raw))
@@ -158,12 +160,14 @@ class MetalExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             host_file = Path(directory) / "layer.m"
             binary = host_file.with_suffix("")
-            for options in ([], ["--no-fuse"]):
+            for options in ([], ["--no-fuse"], ["--metal-kernel", "tiled"],
+                            ["--metal-kernel", "tiled", "--no-fuse"]):
                 with self.subTest(options=options):
                     subprocess.run(cli + ["compile", str(HERE / "examples/layer.tensor"),
                                           "--backend", "metal", "--out", str(host_file)] + options,
                                    check=True, capture_output=True)
-                    self.assertEqual("// matmul_bias_relu:" in host_file.with_suffix(".metal").read_text(), not options)
+                    self.assertEqual("// matmul_bias_relu:" in host_file.with_suffix(".metal").read_text(),
+                                     "--no-fuse" not in options)
                     for name, expected in (("layer.json", [0, 3.5, 0, 0.5, 3, 0, 0, 0]),
                                            ("layer-alt.json", [1, 2, 1, 2, 1, 2, 1, 2])):
                         output = subprocess.check_output([str(binary), str(HERE / "examples" / name)], text=True)
@@ -182,16 +186,44 @@ class MetalExecutionTests(unittest.TestCase):
             output = Path(directory) / "report.json"
             result = subprocess.run([sys.executable, str(HERE / "benchmark.py"), "--backends", "cpu", "metal",
                                      "--sizes", "4", "--iterations", "2", "--warmups", "1",
+                                     "--metal-kernels", "untiled", "tiled",
                                      "--workdir", str(Path(directory) / "work"), "--out", str(output)],
                                     text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = json.loads(output.read_text())["results"]
-            self.assertEqual(len(rows), 4)
+            self.assertEqual(len(rows), 6)
+            self.assertEqual({row["metal_kernel"] for row in rows if row["backend"] == "metal"}, {"untiled", "tiled"})
             self.assertTrue(all(row["verified"] for row in rows))
             for row in rows:
                 if row["backend"] == "metal":
                     self.assertIsNotNone(row["gpu_command_summary"])
                     self.assertEqual(len(row["gpu_command_ms"]), 2)
+
+    def test_tiled_matrix_edges(self):
+        rng = random.Random(71)
+        shapes = [(1, 17, 33), (33, 19, 1), (16, 16, 16), (17, 19, 33), (33, 17, 31),
+                  (32, 32, 32), (31, 33, 65)]
+        with tempfile.TemporaryDirectory() as directory:
+            host = Path(directory) / "tile.m"
+            binary = host.with_suffix("")
+            data_file = Path(directory) / "input.json"
+            for (rows, inner, columns), fuse in itertools.product(shapes, (False, True)):
+                with self.subTest(shape=(rows, inner, columns), fuse=fuse):
+                    inputs, root = parse(f"input x: matrix[{rows},{inner}] input w: matrix[{inner},{columns}] "
+                                         f"input b: vector[{columns}] output = relu(x @ w + b)")
+                    raw = {"x": [[rng.uniform(-2, 2) for _ in range(inner)] for _ in range(rows)],
+                           "w": [[rng.uniform(-2, 2) for _ in range(columns)] for _ in range(inner)],
+                           "b": [rng.uniform(-2, 2) for _ in range(columns)]}
+                    expected = evaluate(root, validate_data(inputs, raw, dtype="float32"), dtype="float32")
+                    _, generated = emit_metal(inputs, root, fuse=fuse, metal_kernel="tiled")
+                    host.write_text(generated)
+                    build_host(host, binary)
+                    data_file.write_text(json.dumps(raw))
+                    actual = [float(v) for v in subprocess.check_output([str(binary), str(data_file)], text=True,
+                                                                        timeout=30).splitlines()]
+                    self.assertEqual(len(actual), len(expected))
+                    for a, b in zip(actual, expected):
+                        self.assertTrue(math.isclose(a, b, rel_tol=2e-5, abs_tol=2e-5), (a, b))
 
     def test_gpu_cli_and_input_errors(self):
         cli = [sys.executable, str(HERE / "tensor_compiler.py")]

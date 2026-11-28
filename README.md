@@ -191,9 +191,10 @@ compiler nor the generated source files are needed at execution time.
 
 The host loads validated JSON directly into shared GPU buffers, builds a compute
 pipeline per operation, encodes the operations in dependency order, waits for
-completion, and prints the result. Each kernel handles one output element per
-thread, with a bounds check for the final threadgroup. For matrix multiplication,
-each thread computes its output's row/column dot product. The fused kernel adds
+completion, and prints the result. Elementwise and untiled matrix kernels handle
+one output element per thread, with a bounds check for the final threadgroup.
+The tiled matrix kernel handles four neighboring outputs per thread. For matrix
+multiplication, each output is its row/column dot product. The fused kernel adds
 the column bias after the dot product, applies ReLU, and writes only the final
 result. It removes two intermediate buffers and reduces three dispatches to one
 for that pattern, including when nested inside larger expressions.
@@ -203,7 +204,26 @@ products and additions separately rounded, as in the CPU reference. All declared
 inputs are still required. `check` shows the fused graph; `--no-fuse` disables the
 pass for both inspection and compilation.
 
-This uses a simple, untiled matrix kernel. Shader compilation, pipeline creation,
+The original untiled matrix kernel is retained as the default baseline. Select
+the new tiled implementation explicitly:
+
+```sh
+python3 tensor_compiler.py compile examples/layer.tensor --backend metal --metal-kernel tiled --out build/layer_tiled.m
+./build/layer_tiled examples/layer.json
+```
+
+Use `--metal-kernel untiled` to force the baseline. Both options support fusion
+and `--no-fuse`; addition and ReLU keep their elementwise kernels. The tiled
+kernel launches 16-by-16 threadgroups, with each thread computing a 2-by-2 output
+block. Threads cooperatively load two 32-by-32 input blocks into threadgroup
+memory, synchronize, and reuse those blocks and register values while computing
+their output dot products. Out-of-bounds loads are filled with zero,
+but every thread still participates in the barriers. The final partial inner
+block processes only real elements, preserving reduction order and rounding.
+The tiled pipeline requires support for 256 threads per group and reports an
+error if that limit is unavailable.
+
+Shader compilation, pipeline creation,
 and JSON loading occur once per process; pipeline states and buffers are reused
 when benchmarking repeated calculations. GPU launch overhead occurs on every
 iteration.
@@ -224,6 +244,35 @@ Metal is requested; the harness reports an error rather than silently dropping
 it. Default sizes are 16, 64, and 128; shapes are square. Generated programs and
 inputs are kept in `build/benchmarks/`. The default JSON report is
 `build/benchmarks/report.json`; choose another path with `--out`.
+
+To compare tiled and untiled GPU kernels in the same run:
+
+```sh
+python3 benchmark.py --backends metal --metal-kernels untiled tiled --sizes 16 64 128 256 --iterations 30 --warmups 5 --out build/benchmarks/tiling.json
+```
+
+This tests both fused and unfused versions of each selected kernel. Include
+`cpu` in `--backends` to add CPU variants. The default benchmark kernel remains
+`untiled`; each report row records the selected implementation.
+
+A second M3 run comparing the two kernels, with 30 measured iterations and 5
+warmups, produced these fused wall medians (milliseconds):
+
+| Square size | Untiled | Tiled |
+| --- | ---: | ---: |
+| 16 | 0.392 | 0.363 |
+| 64 | 0.196 | 0.381 |
+| 128 | 0.376 | 0.382 |
+| 256 | 0.542 | 0.467 |
+
+At 256, the tiled fused variant reduced wall time by about 14%; its median GPU
+command time fell from 0.258 to 0.112 ms. Smaller sizes were mixed, and launch
+latency and system variation affect the wall samples. The untiled kernel remains
+the default rather than assuming tiling always wins. Unfused variants, raw
+samples, and verification results are in
+[benchmarks/apple-m3-tiling.json](benchmarks/apple-m3-tiling.json). This is a
+single-machine observation, not a general performance guarantee or an automatic
+kernel-selection rule.
 
 Each executable also supports benchmarks directly. For example:
 
@@ -299,7 +348,9 @@ as errors, run generated kernels, and compare GPU results with float32 CPU and
 interpreter results. They cover fused and unfused matrix calculations, rectangular
 and single-element matrices, nested layers, computed biases, broadcasting,
 identity output, zero inputs, partial threadgroups, rounding-sensitive reductions,
-and input errors. Random comparisons use relative and absolute tolerances of
+and input errors. Both tiled and untiled kernels are exercised, including dimensions
+below, equal to, and above the tile size and incomplete blocks in all dimensions.
+Random comparisons use relative and absolute tolerances of
 `2e-5`; dedicated rounding and ReLU boundary cases require exact results. GPU execution tests are
 explicitly skipped when a Metal device is unavailable.
 
@@ -309,5 +360,5 @@ benchmark reports, sample counts, checksums, and the command-line harness.
 
 ## Next milestones
 
-1. Use benchmark results to guide GPU optimizations such as tiled matrix multiplication.
-2. Expand measurements to rectangular shapes and compare against optimized libraries.
+1. Expand measurements to rectangular shapes and compare against optimized libraries.
+2. Use the measurements to tune tile sizes, kernel selection, and memory access patterns.
